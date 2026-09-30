@@ -1,16 +1,22 @@
-//! HTTP middleware: request id + tracing span. Request timeout, body limit and
-//! tracing layers are applied in [`crate::router`] via `tower-http`. Per-repo
-//! concurrency limiting lives in the handlers (they hold a repo-keyed semaphore
-//! for the duration of the git operation).
+//! HTTP middleware: request id + tracing span, global request limits, and
+//! per-repository concurrency limits.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::StatusCode;
 use axum::http::{HeaderValue, Request};
 use axum::middleware::Next;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use dashmap::DashMap;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -68,6 +74,82 @@ impl http_body::Body for CountedBody {
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
     }
+}
+
+/// Global request limits shared by every clone of the router.
+#[derive(Clone)]
+pub struct RequestLimits {
+    permits: Arc<Semaphore>,
+    timeout: Duration,
+}
+
+impl RequestLimits {
+    pub fn new(max_concurrent: usize, timeout: Duration) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrent)),
+            timeout,
+        }
+    }
+}
+
+/// Response body that holds its concurrency permit and enforces the request's
+/// original deadline for the full lifetime of a streaming response.
+struct LimitedBody {
+    inner: Body,
+    _permit: OwnedSemaphorePermit,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl http_body::Body for LimitedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request deadline exceeded",
+            )))));
+        }
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Apply the configured global concurrency cap and one deadline spanning queue
+/// time, handler execution, and streaming response delivery.
+pub async fn request_limits(
+    State(limits): State<RequestLimits>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let deadline = tokio::time::Instant::now() + limits.timeout;
+    let permit = match tokio::time::timeout_at(deadline, limits.permits.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => unreachable!("global request semaphore is never closed"),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    let response = match tokio::time::timeout_at(deadline, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    response.map(|body| {
+        Body::new(LimitedBody {
+            inner: body,
+            _permit: permit,
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+        })
+    })
 }
 
 /// Generate a request id, attach it to the `http.request` span + response

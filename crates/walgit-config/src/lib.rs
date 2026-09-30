@@ -1078,6 +1078,14 @@ impl Config {
         self.refs.validate()?;
         self.packs.validate()?;
         anyhow::ensure!(
+            self.server.max_concurrent_requests > 0,
+            "server.max_concurrent_requests must be positive"
+        );
+        anyhow::ensure!(
+            !self.server.request_timeout.is_zero(),
+            "server.request_timeout must be positive"
+        );
+        anyhow::ensure!(
             self.packfile_uri.uri_min_bytes.as_u64() > 0,
             "packfile_uri.uri_min_bytes must be positive"
         );

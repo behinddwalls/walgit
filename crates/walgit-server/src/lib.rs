@@ -86,6 +86,8 @@ pub struct AppState {
     pub registry: Arc<walgit_wal::Registry>,
     pub auth: Arc<auth::Authenticator>,
     pub semaphores: middleware::RepoSemaphores,
+    /// Global request concurrency and deadline enforcement.
+    pub request_limits: middleware::RequestLimits,
     /// HTTP requests in flight (counted until the response body is done); on the watchdog line.
     pub inflight: Arc<middleware::Inflight>,
     pub caches: cache::ServerCaches,
@@ -123,6 +125,10 @@ impl AppState {
             registry,
             auth: auth::Authenticator::new(&cfg),
             semaphores: middleware::RepoSemaphores::new(cfg.server.max_concurrent_per_repo),
+            request_limits: middleware::RequestLimits::new(
+                cfg.server.max_concurrent_requests,
+                cfg.server.request_timeout,
+            ),
             inflight: Arc::new(middleware::Inflight::default()),
             caches: cache::ServerCaches::new(&cfg),
             metrics_handle,
@@ -240,6 +246,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             web::canonical_browser_host,
+        ))
+        // Bound queued + running requests. The permit and deadline remain attached
+        // to streaming response bodies, not merely to the handler future.
+        .layer(axum::middleware::from_fn_with_state(
+            state.request_limits.clone(),
+            middleware::request_limits,
         ))
         // Outermost: `http.request` span (request_id, trace, principal, repo,
         // status, elapsed) — every log line inside inherits its fields.
