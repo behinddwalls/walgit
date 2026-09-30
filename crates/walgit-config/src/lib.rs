@@ -1082,6 +1082,10 @@ impl Config {
             "server.max_concurrent_requests must be positive"
         );
         anyhow::ensure!(
+            self.server.max_concurrent_per_repo > 0,
+            "server.max_concurrent_per_repo must be positive"
+        );
+        anyhow::ensure!(
             !self.server.request_timeout.is_zero(),
             "server.request_timeout must be positive"
         );
@@ -1358,6 +1362,14 @@ mod tests {
         let text = toml::to_string(&c).unwrap();
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.store.bucket, c.store.bucket);
+    }
+
+    #[test]
+    fn zero_per_repo_concurrency_is_rejected() {
+        let mut c = Config::default();
+        c.server.max_concurrent_per_repo = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("server.max_concurrent_per_repo must be positive"));
     }
 
     #[test]
