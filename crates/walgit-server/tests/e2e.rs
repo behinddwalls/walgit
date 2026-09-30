@@ -30,7 +30,59 @@ async fn info_refs_v2_advertises_capabilities() -> TestResult {
     assert!(out.contains("version 2"));
     assert!(out.contains("ls-refs=unborn"));
     assert!(out.contains("fetch=shallow wait-for-done"));
+    assert!(out.contains("object-info"));
     assert!(!out.contains("bundle-uri"), "{out}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_info_v2_reports_object_size() -> TestResult {
+    let server = Server::start().await?;
+    server.put_repo("t", "object-info").await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(
+        &src,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &server.repo_url("t", "object-info"),
+        ],
+    )?;
+    git_in(&src, &["push", "-q", "origin", "main"])?;
+    let oid = git_in(&src, &["rev-parse", "main"])?;
+    let size = git_in(&src, &["cat-file", "-s", oid.trim()])?;
+
+    let mut body = Vec::new();
+    walgit_server::pktline::encode_text(&mut body, "command=object-info\n");
+    walgit_server::pktline::encode_delim(&mut body);
+    walgit_server::pktline::encode_text(&mut body, "size\n");
+    walgit_server::pktline::encode_text(&mut body, &format!("oid {}\n", oid.trim()));
+    walgit_server::pktline::encode_flush(&mut body);
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/t/object-info.git/git-upload-pack",
+            server.base_url
+        ))
+        .header("Git-Protocol", "version=2")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-git-upload-pack-request",
+        )
+        .body(body)
+        .send()
+        .await?;
+    assert!(response.status().is_success());
+    let response = response.bytes().await?;
+    let expected = format!("{} {}\n", oid.trim(), size.trim());
+    assert!(
+        response
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
     Ok(())
 }
 
