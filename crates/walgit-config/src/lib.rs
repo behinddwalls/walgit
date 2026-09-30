@@ -565,8 +565,6 @@ pub struct UpstreamConfig {
     reason = "Independent configuration switches, not mutually exclusive states"
 )]
 pub struct GitConfig {
-    /// Path to the upstream git binary (repack, optional upload-pack engine).
-    pub binary: PathBuf,
     pub upload_pack_engine: UploadPackEngine,
     pub allow_filter: bool,
     /// Default object format for new repos.
@@ -923,7 +921,6 @@ impl Default for LfsConfig {
 impl Default for GitConfig {
     fn default() -> Self {
         GitConfig {
-            binary: PathBuf::from("git"),
             upload_pack_engine: UploadPackEngine::Auto,
             allow_filter: true,
             object_format: ObjectFormat::Sha1,
@@ -1565,6 +1562,13 @@ mod tests {
                 .unwrap()
                 .contains("[compaction]")
         );
+    }
+
+    #[test]
+    fn removed_git_binary_configuration_is_rejected() {
+        let input = "[git]\nbinary = \"/opt/git/bin/git\"\n";
+        assert!(Config::parse(input).is_err());
+        assert!(Config::default().with_settings(input).is_err());
     }
 
     #[test]
