@@ -64,6 +64,7 @@ pub struct S3Store {
     http: reqwest::Client,
     multipart_threshold: u64,
     multipart_part_size: u64,
+    max_retries: u32,
 }
 
 impl S3Store {
@@ -92,6 +93,10 @@ impl S3Store {
             .region(region)
             .credentials_provider(creds)
             .force_path_style(cfg.s3.force_path_style)
+            .retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard()
+                    .with_max_attempts(cfg.max_retries.saturating_add(1)),
+            )
             .behavior_version_latest();
 
         if !cfg.s3.endpoint.is_empty() {
@@ -107,6 +112,7 @@ impl S3Store {
             http,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: cfg.multipart_part_size.as_u64(),
+            max_retries: cfg.max_retries,
         })
     }
 
@@ -138,14 +144,42 @@ impl S3Store {
             .await
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning get: {e}")))?;
 
-        let mut req = self.http.get(presigned.uri());
-        for (name, value) in presigned.headers() {
-            req = req.header(name, value);
+        let mut attempt = 0u32;
+        loop {
+            let mut req = self.http.get(presigned.uri());
+            for (name, value) in presigned.headers() {
+                req = req.header(name, value);
+            }
+            match req.send().await {
+                Ok(response)
+                    if matches!(response.status().as_u16(), 429 | 500..=599)
+                        && attempt < self.max_retries =>
+                {
+                    tracing::warn!(
+                        key,
+                        attempt,
+                        status = %response.status(),
+                        "retrying transient s3 get"
+                    );
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < self.max_retries => {
+                    tracing::warn!(key, attempt, %error, "retrying failed s3 get");
+                }
+                Err(error) => {
+                    return Err(StoreError::retryable(anyhow::anyhow!(
+                        "s3 get http: {error}"
+                    )));
+                }
+            }
+            let delay = util::backoff(
+                attempt,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(2),
+            );
+            attempt += 1;
+            tokio::time::sleep(delay).await;
         }
-
-        req.send()
-            .await
-            .map_err(|e| StoreError::retryable(anyhow::anyhow!("s3 get http: {e}")))
     }
 
     fn get_result_from_response(key: &str, resp: reqwest::Response) -> Result<GetResult> {
